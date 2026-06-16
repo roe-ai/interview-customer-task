@@ -1,6 +1,20 @@
-# Roe AI Python SDK
+# Roe Python SDK
 
-A Python SDK for the [Roe AI](https://www.roe-ai.com/) API.
+A Python SDK for the [Roe](https://www.roe-ai.com/) API.
+
+<!-- ROE-SDK:RELEASE-BANNER:START -->
+> **v1.1.0** - Schema synchronization across the public SDKs: roe-ai
+> (Python), roe-typescript, and roe-golang. This release is generated from
+> SDK OpenAPI marker `1-0-83`, and all public package metadata is bumped to
+> 1.1.0.
+> Python friendly wrappers are generated from `openapi/wrappers.yml`;
+> current generated facades include `client.discovery` and `client.tables`.
+<!-- ROE-SDK:RELEASE-BANNER:END -->
+
+> **v1.0.0** — The SDK delegates to OpenAPI-generated types and transports
+> (`roe._generated`); ergonomic wrappers on `client.agents` and
+> `client.policies` remain. Noteworthy API and behavioral changes compared
+> to earlier releases are listed in **[CHANGELOG.md](CHANGELOG.md)**.
 
 ## Installation
 
@@ -29,13 +43,15 @@ for output in result.outputs:
 Or set environment variables:
 
 ```bash
-export ROE_ORGANIZATION_API_KEY="your-api-key"
+export ROE_API_KEY="your-api-key"
 export ROE_ORGANIZATION_ID="your-org-uuid"
 ```
 
 ## Job Result Inspection
 
-After waiting for a job, you can inspect its outcome using status helpers:
+After waiting for a job, inspect its outcome using the `JobStatus` enum.
+The terminal status and error message are stuffed into the generated
+response's `additional_properties` and accessed via subscript:
 
 ```python
 from roe import JobStatus
@@ -43,21 +59,96 @@ from roe import JobStatus
 result = job.wait()
 
 # Check job outcome
-if result.succeeded:
+if result["status"] in (JobStatus.SUCCESS, JobStatus.CACHED):
     for output in result.outputs:
         print(f"{output.key}: {output.value}")
-elif result.cancelled:
+elif result["status"] == JobStatus.CANCELLED:
     print("Job was cancelled")
-elif result.failed:
-    print("Error:", result.error_message)
+elif result["status"] == JobStatus.FAILURE:
+    print("Error:", result["error_message"])
 
 # Available fields
-result.status         # JobStatus code (int) or None
-result.error_message  # Error string or None
-result.succeeded      # True if SUCCESS or CACHED
-result.failed         # True if FAILURE or CANCELLED
-result.cancelled      # True if CANCELLED
+result.outputs           # list[AgentDatum] (direct attribute on the generated model)
+result["status"]         # JobStatus code (int) — set by Job.wait()
+result["error_message"]  # Error string or None — set by Job.wait()
 ```
+
+## Errors
+
+Non-2xx responses raise typed exceptions from `roe.exceptions`, all
+subclasses of `RoeAPIException`. Use them to handle expected failures
+without parsing error strings:
+
+```python
+from roe.exceptions import (
+    RoeAPIException,
+    BadRequestError,            # 400 — validation / bad input
+    AuthenticationError,        # 401 — missing or invalid API key
+    InsufficientCreditsError,   # 402 — plan limit / billing
+    ForbiddenError,             # 403 — feature or resource forbidden
+    NotFoundError,              # 404 — resource not found
+    ServerError,                # 5xx — server-side
+)
+
+try:
+    client.agents.retrieve("00000000-0000-0000-0000-000000000000")
+except NotFoundError as exc:
+    print(exc.status_code, exc.message)
+```
+
+Every `RoeAPIException` also carries `exc.headers` (lowercase-keyed dict
+of the upstream response headers). Use it to read `Retry-After` on 429s
+or `X-Request-Id` for support tickets, without falling back to the raw
+httpx layer. `Retry-After` is preserved exactly as sent, so it may be
+numeric seconds or an HTTP-date:
+
+```python
+except RoeAPIException as exc:
+    if exc.status_code == 429 and exc.headers:
+        retry_after = exc.headers.get("retry-after")
+```
+
+`job.wait()` does not raise on agent-side failures — instead the returned
+result carries `result["status"] == JobStatus.FAILURE` and
+`result["error_message"]`. Transport / HTTP errors hit the typed
+hierarchy above.
+
+## Raw API Access
+
+When the ergonomic wrappers don't expose an endpoint you need, the generated
+client is available as `client.raw` and the operation modules live under
+`roe._generated.api.<tag>.<operation_id>`. Submodule names follow the
+upstream OpenAPI tags + `operationId`s and may shift across releases, so the
+portable form uses `client.raw.get_httpx_client()` to send a request through
+the same auth-configured `httpx.Client`:
+
+```python
+from roe import RoeClient
+
+client = RoeClient(api_key="your-api-key", organization_id="your-org-uuid")
+response = client.raw.get_httpx_client().get("/v1/users/current_user/")
+print(response.status_code)
+```
+
+For typed request/response models, call the generated operation module
+directly — see `roe/_generated/api/` for the current surface.
+
+<!-- ROE-SDK:GENERATED-FRIENDLY-APIS:START -->
+## Generated Friendly APIs
+
+This block is synced from `roe-main/roe-sdk/sdk_contract.yml` during SDK fan-out.
+
+```python
+engines = client.discovery.list_agent_engine_types()
+models = client.discovery.list_supported_models(capability="text")
+
+upload = client.tables.upload(
+    table_name="customers",
+    file="customers.csv",
+    with_headers=True,
+)
+```
+<!-- ROE-SDK:GENERATED-FRIENDLY-APIS:END -->
 
 ## Agent Examples
 
@@ -160,11 +251,8 @@ agent = client.agents.create(
 job = client.agents.run(agent_id=str(agent.id), url="https://www.roe-ai.com/")
 result = job.wait()
 
-# Download saved references (screenshots, HTML, markdown)
-for ref in result.get_references():
-    content = client.agents.jobs.download_reference(str(job.id), ref.resource_id)
-    with open(ref.resource_id, "wb") as f:
-        f.write(content)
+for output in result.outputs:
+    print(f"{output.key}: {output.value}")
 ```
 
 ### Interactive Web
@@ -426,9 +514,9 @@ agent = client.agents.create(
 
 ## Retry Behavior
 
-The SDK automatically retries idempotent requests (GET, PUT, DELETE) that receive `502`, `503`, or `504` responses using exponential backoff (1s, 2s, 4s, …). By default, up to 3 retries are attempted before raising a `ServerError`. POST requests are never retried to avoid duplicate submissions.
-
-You can configure the retry count via the `max_retries` parameter or the `ROE_MAX_RETRIES` environment variable:
+Transient failures are retried with exponential backoff capped at about 10
+seconds per attempt. By default there are up to 3 retries (configurable via
+`max_retries` or `ROE_MAX_RETRIES`):
 
 ```python
 client = RoeClient(
@@ -438,7 +526,14 @@ client = RoeClient(
 )
 ```
 
-Other error codes (400, 401, 404, 500, etc.) are raised immediately without retrying.
+**Retried:** HTTP statuses `408`, `429`, and any `5xx`, plus transport errors
+(for example disconnects and timeouts). JSON `POST` bodies may be replayed;
+multipart agent-run calls (`run`, `run_sync`, …) opt out via
+`x-roe-skip-retry` so they are not automatically retried at the transport layer.
+
+**Not retried immediately:** Typical client/auth responses (`401`, `403`,
+`404`, validation `422`, …) — surfaced as typed exceptions matching the SDK’s
+usual error mapping.
 
 ## Batch Processing
 
@@ -534,7 +629,12 @@ client.agents.update("uuid", name="New Name")
 client.agents.delete("uuid")
 
 # Duplicate
-new_agent = client.agents.duplicate("uuid")
+#
+# Note: client.agents.duplicate(...) returns an AgentVersion (the new agent's
+# first version), not a BaseAgent. The new agent's ID is reachable on the
+# returned object as `.base_agent.id`:
+duplicated_version = client.agents.duplicate("uuid")
+new_agent_id = duplicated_version.base_agent.id
 ```
 
 ## Version Management
@@ -583,30 +683,23 @@ client.agents.jobs.delete_data(job_id)
 
 | Model | Value |
 |-------|-------|
+| GPT-5.5 Pro | `gpt-5.5-pro-2026-04-23` |
+| GPT-5.5 | `gpt-5.5-2026-04-23` |
+| GPT-5.4 Pro | `gpt-5.4-pro-2026-03-05` |
 | GPT-5.4 | `gpt-5.4-2026-03-05` |
+| GPT-5.4 Mini | `gpt-5.4-mini-2026-03-17` |
+| GPT-5.4 Nano | `gpt-5.4-nano-2026-03-17` |
 | GPT-5.2 | `gpt-5.2-2025-12-11` |
-| GPT-5.1 | `gpt-5.1-2025-11-13` |
 | GPT-5 | `gpt-5-2025-08-07` |
-| GPT-5 Mini | `gpt-5-mini-2025-08-07` |
 | GPT-4.1 | `gpt-4.1-2025-04-14` |
-| GPT-4.1 Mini | `gpt-4.1-mini-2025-04-14` |
-| O3 Pro | `o3-pro-2025-06-10` |
-| O3 | `o3-2025-04-16` |
-| O4 Mini | `o4-mini-2025-04-16` |
+| Claude Opus 4.8 | `claude-opus-4-8` |
+| Claude Opus 4.7 | `claude-opus-4-7` |
 | Claude Opus 4.6 | `claude-opus-4-6` |
 | Claude Sonnet 4.6 | `claude-sonnet-4-6` |
-| Claude Opus 4.5 | `claude-opus-4-5-20251101` |
-| Claude Sonnet 4.5 | `claude-sonnet-4-5-20250929` |
-| Claude Opus 4.1 | `claude-opus-4-1-20250805` |
-| Claude Opus 4 | `claude-opus-4-20250514` |
-| Claude Sonnet 4 | `claude-sonnet-4-20250514` |
 | Claude Haiku 4.5 | `claude-haiku-4-5-20251001` |
-| Gemini 3 Pro | `gemini-3-pro-preview` |
+| Gemini 3.1 Pro | `gemini-3.1-pro-preview` |
 | Gemini 3 Flash | `gemini-3-flash-preview` |
-| Gemini 2.5 Pro | `gemini-2.5-pro` |
-| Gemini 2.5 Flash | `gemini-2.5-flash` |
-| Grok 4 | `grok-4-0709` |
-| Grok 4.1 Fast Reasoning | `grok-4-1-fast-reasoning` |
+| Grok 4.20 Reasoning | `grok-4.20-0309-reasoning` |
 
 ## Engine Classes
 
@@ -618,10 +711,10 @@ client.agents.jobs.delete_data(job_id)
 | Web Insights | `URLWebsiteExtractionEngine` |
 | Interactive Web | `InteractiveWebExtractionEngine` |
 | Web Search | `URLFinderEngine` |
-| Perplexity Search | `PerplexitySearchEngine` |
+| Research | `ResearchEngine` |
 | Maps Search | `GoogleMapsEntityExtractionEngine` |
-| LinkedIn Crawler | `LinkedInScraperEngine` |
 | Social Media | `SocialScraperEngine` |
+| Marketplace Storefront Analysis | `MarketplaceStorefrontAnalysisEngine` |
 | Product Compliance | `ProductPolicyEngine` |
 | Merchant Risk | `MerchantRiskEngine` |
 | AML Investigation | `AMLInvestigationEngine` |
@@ -629,6 +722,7 @@ client.agents.jobs.delete_data(job_id)
 
 ## Links
 
-- [Roe AI](https://www.roe-ai.com/)
+- [Roe](https://www.roe-ai.com/)
 - [API Documentation](https://docs.roe-ai.com)
+- [Changelog](CHANGELOG.md)
 - [Examples](examples/)
